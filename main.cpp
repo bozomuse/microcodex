@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "agent.h"
+#include "allocator-memory.h"
 #include "conversation.h"
 #include "model-catalog.h"
 #include "oauth.h"
@@ -291,6 +292,8 @@ namespace {
 } // namespace
 
 int main(const int argc, char *argv[]) {
+    microcodex::configureAllocatorForLowMemory();
+
     const std::string_view executable = argc > 0 ? argv[0] : "microcodex";
     if (argc > 1 && (std::string_view(argv[1]) == "--help" || std::string_view(argv[1]) == "-h")) {
         printUsage(executable);

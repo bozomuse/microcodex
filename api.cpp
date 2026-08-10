@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "api.h"
+#include "allocator-memory.h"
 #include "http.h"
 #include "json.h"
 #include "response-item.h"
@@ -1043,6 +1044,7 @@ namespace microcodex {
         compaction_generation_ = prepared->checkpoint.generation;
         reported_input_tokens_ = 0;
         turn_state_.clear();
+        (void)releaseUnusedHeap();
         return {};
     }
 

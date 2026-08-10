@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "styled-text.h"
+#include "allocator-memory.h"
 #include "markdown.h"
 #include "shell-highlight.h"
 #include "terminal.h"
@@ -1251,6 +1252,9 @@ namespace {
             state.status = "Turn failed";
         }
 
+        // The request body, streaming state, futures, and tool results owned by
+        // the completed turn are now unreachable.
+        (void)microcodex::releaseUnusedHeap();
         state.dirty = true;
     }
 
@@ -1269,6 +1273,7 @@ namespace {
             state.transcript_bytes = 0;
             state.scroll = 0;
             state.status = "Conversation reset";
+            (void)microcodex::releaseUnusedHeap();
         }
         state.dirty = true;
     }
