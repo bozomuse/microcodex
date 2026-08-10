@@ -950,7 +950,7 @@ namespace microcodex {
             .body = request_body,
             .idle_timeout_seconds = config_.idle_timeout_seconds,
             .total_timeout_seconds = 0,
-            .maximum_response_bytes = 64 * 1024,
+            .maximum_response_bytes = 4 * 1024, // 4 KB
             .stop_token = stop_token,
         }, receiveResponseBody, receiveResponseHeader, &state);
         if (!response) {
