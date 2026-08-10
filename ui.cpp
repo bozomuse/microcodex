@@ -40,6 +40,9 @@ namespace {
     using microcodex::ui::wrapStyledSpans;
 
     constexpr std::size_t maximum_transcript_bytes = 512 * 1024;
+    // Rendered Markdown is replaceable, so it has a separate shared budget and
+    // never forces authoritative transcript entries out of the UI.
+    constexpr std::size_t maximum_markdown_cache_bytes = 512 * 1024;
     constexpr std::size_t maximum_tool_preview_bytes = 16 * 1024;
     constexpr std::size_t large_paste_character_threshold = 1000;
     constexpr std::size_t maximum_collapsed_tool_output_rows = 5;
@@ -71,6 +74,7 @@ namespace {
         // revision key. Width changes naturally invalidate resize layout.
         std::vector<StyledLine> lines;
         std::size_t source_size = 0;
+        std::size_t retained_bytes = 0;
         int width = -1;
     };
 
@@ -96,9 +100,11 @@ namespace {
         std::string active_model;
         std::size_t input_cursor = 0;
         std::size_t transcript_bytes = 0;
+        std::size_t markdown_cache_bytes = 0;
         std::size_t scroll = 0;
         std::chrono::steady_clock::time_point turn_started_at{};
         int working_row = -1;
+        int markdown_cache_width = -1;
         bool tool_output_expanded = false;
         bool pasting = false;
         bool dirty = true;
@@ -202,9 +208,54 @@ namespace {
                entry.text.size() + entry.output.size() + editBytes(entry.edit);
     }
 
+    bool addMarkdownAllocation(std::size_t &bytes, const std::size_t count,
+                               const std::size_t element_size) {
+        // Values above the budget are all equivalent: the render will not be
+        // retained. Capping here also keeps capacity multiplication safe.
+        constexpr std::size_t rejected = maximum_markdown_cache_bytes + 1;
+        if (bytes >= rejected || count > (rejected - bytes) / element_size) {
+            bytes = rejected;
+            return false;
+        }
+        bytes += count * element_size;
+        return bytes <= maximum_markdown_cache_bytes;
+    }
+
+    std::size_t markdownRenderBytes(const std::vector<StyledLine> &lines) {
+        std::size_t bytes = 0;
+        if (!addMarkdownAllocation(bytes, lines.capacity(), sizeof(StyledLine))) {
+            return bytes;
+        }
+        for (const StyledLine &line : lines) {
+            if (!addMarkdownAllocation(bytes, line.spans.capacity(), sizeof(StyledSpan))) {
+                return bytes;
+            }
+            for (const StyledSpan &span : line.spans) {
+                // Counting string capacity is intentionally conservative. It
+                // gives caches with many short styled spans a fair memory cost.
+                if (!addMarkdownAllocation(bytes, span.text.capacity(), sizeof(char))) {
+                    return bytes;
+                }
+            }
+        }
+        return bytes;
+    }
+
+    void releaseMarkdownCache(UiState &state, MarkdownRenderCache &cache) {
+        state.markdown_cache_bytes -= cache.retained_bytes;
+        cache = {};
+    }
+
+    void releaseMarkdownCaches(UiState &state) {
+        for (UiEntry &entry : state.transcript) {
+            releaseMarkdownCache(state, entry.markdown_cache);
+        }
+    }
+
     void trimTranscript(UiState &state) {
         while (state.transcript_bytes > maximum_transcript_bytes && state.transcript.size() > 1) {
             state.transcript_bytes -= entryBytes(state.transcript.front());
+            releaseMarkdownCache(state, state.transcript.front().markdown_cache);
             state.transcript.pop_front();
         }
     }
@@ -892,17 +943,10 @@ namespace {
         appendLines(lines, std::move(output_lines));
     }
 
-    void appendAssistantLines(std::vector<StyledLine> &lines, UiEntry &entry, const int width) {
-        const int content_width = std::max(1, width - 2);
-        MarkdownRenderCache &cache = entry.markdown_cache;
-        if (cache.width != content_width || cache.source_size != entry.text.size()) {
-            cache.lines = renderMarkdown(entry.text, content_width);
-            cache.source_size = entry.text.size();
-            cache.width = content_width;
-        }
-
+    void appendRenderedAssistantLines(std::vector<StyledLine> &lines,
+                                      const std::vector<StyledLine> &rendered) {
         bool first_content_line = true;
-        for (const StyledLine &source : cache.lines) {
+        for (const StyledLine &source : rendered) {
             if (source.spans.empty()) {
                 lines.push_back(source);
                 continue;
@@ -923,7 +967,44 @@ namespace {
         }
     }
 
+    void appendAssistantLines(std::vector<StyledLine> &lines, UiState &state,
+                              UiEntry &entry, const int width) {
+        const int content_width = std::max(1, width - 2);
+        MarkdownRenderCache &cache = entry.markdown_cache;
+        if (cache.width == content_width && cache.source_size == entry.text.size()) {
+            appendRenderedAssistantLines(lines, cache.lines);
+            return;
+        }
+
+        releaseMarkdownCache(state, cache);
+        std::vector<StyledLine> rendered = renderMarkdown(entry.text, content_width);
+        const std::size_t rendered_bytes = markdownRenderBytes(rendered);
+        // Keep the admitted set stable. A redraw visits every transcript entry,
+        // so evicting a valid cache here would make the set rotate and reparse.
+        if (rendered_bytes <= maximum_markdown_cache_bytes - state.markdown_cache_bytes) {
+            cache.lines = std::move(rendered);
+            cache.source_size = entry.text.size();
+            cache.retained_bytes = rendered_bytes;
+            cache.width = content_width;
+            state.markdown_cache_bytes += rendered_bytes;
+            appendRenderedAssistantLines(lines, cache.lines);
+            return;
+        }
+
+        // The budget limits retained caches, not rendering correctness. Use an
+        // oversized result for this frame, then let the temporary release it.
+        appendRenderedAssistantLines(lines, rendered);
+    }
+
     std::vector<StyledLine> transcriptLines(UiState &state, const int width) {
+        const int content_width = std::max(1, width - 2);
+        if (state.markdown_cache_width != content_width) {
+            // Every cached line wraps at the old terminal width. Releasing all
+            // of them first prevents stale entries from occupying the budget.
+            releaseMarkdownCaches(state);
+            state.markdown_cache_width = content_width;
+        }
+
         std::vector<StyledLine> lines;
         const UiEntry *previous_entry = nullptr;
         for (UiEntry &entry : state.transcript) {
@@ -955,7 +1036,7 @@ namespace {
                 break;
             }
             case EntryKind::Assistant:
-                appendAssistantLines(lines, entry, width);
+                appendAssistantLines(lines, state, entry, width);
                 lines.push_back({});
                 break;
             case EntryKind::Tool:
@@ -1269,6 +1350,7 @@ namespace {
         if (!reset) {
             state.status = reset.error();
         } else {
+            releaseMarkdownCaches(state);
             state.transcript.clear();
             state.transcript_bytes = 0;
             state.scroll = 0;
