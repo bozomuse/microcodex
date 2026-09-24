@@ -52,3 +52,21 @@ expect_process "T9.6: the conversation continues normally after the failure" 0 \
 Alpha and beta recalled
 STDOUT
 STDERR
+
+stream_home=$TEST_WORKDIR/stream-home
+write_test_credentials "$stream_home" || exit 1
+
+expect_process "T9.7: terminal stream errors are returned without retrying" 1 \
+    run_with_mock stream-error env CODEX_HOME="$stream_home" PATH="$TEST_BIN_DIR:$PATH" \
+        microcodex --model test-model Trigger stream failure <<'STDOUT' 3<<'STDERR'
+doomed
+STDOUT
+Agent failed: boom
+STDERR
+
+expect_process "T9.8: a dropped mid-stream connection retries without duplicating text" 0 \
+    run_with_mock stream-drop env CODEX_HOME="$stream_home" PATH="$TEST_BIN_DIR:$PATH" \
+        microcodex --model test-model Survive a mid-stream drop <<'STDOUT' 3<<'STDERR'
+Recovered without duplication
+STDOUT
+STDERR

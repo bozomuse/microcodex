@@ -89,6 +89,8 @@ def validate_scenario!(scenario, request_number, payload)
     validate_coding_tools!(payload)
   when "transient-503", "persistent-503"
     validate_coding_tools!(payload)
+  when "stream-error", "stream-drop"
+    validate_coding_tools!(payload)
   when "paste"
     validate_coding_tools!(payload)
     expected = "before\n#{"x" * 1001}\nafter"
@@ -417,6 +419,17 @@ def response_for(scenario, request_number)
   when "persistent-503"
     [503, "Service Unavailable", "application/json",
      JSON.generate(error: {message: "service unavailable"})]
+  when "stream-error"
+    [200, "OK", "text/event-stream",
+     sse(
+       {type: "response.output_text.delta", delta: "doomed\n"},
+       {type: "response.failed", response: {error: {message: "boom"}}}
+     )]
+  when "stream-drop"
+    # The first attempt drops mid-stream (handled below with an abrupt
+    # close); only the retry gets a full response.
+    [200, "OK", "text/event-stream",
+     message_response("Recovered without duplication")]
   when "tool-write"
     [200, "OK", "text/event-stream",
      request_number.zero? ? tool_call_response : tool_final_response]
@@ -501,6 +514,10 @@ abort "usage: mock-server.rb SCENARIO PORT_FILE REQUEST_DIR" unless ARGV.length 
 scenario, port_file, request_directory = ARGV
 expected_requests = if scenario == "context-error-retry"
                       3
+                    elsif scenario == "stream-drop"
+                      2
+                    elsif scenario == "stream-error"
+                      1
                     elsif scenario == "transient-503"
                       3
                     elsif scenario == "persistent-503"
@@ -555,6 +572,17 @@ while request_number < expected_requests
         rescue Errno::EPIPE, Errno::ECONNRESET
           File.write(File.join(request_directory, "interrupt-observed"), "observed\n")
         end
+      elsif scenario == "stream-drop" && request_number.zero?
+        # Declare more bytes than sent, then drop the connection: the client
+        # must treat this as a transport failure and retry.
+        partial = sse(type: "response.output_text.delta", delta: "Partial then drop")
+        socket.write(
+          "HTTP/1.1 200 OK\r\n" \
+          "Content-Type: text/event-stream\r\n" \
+          "Content-Length: #{partial.bytesize + 512}\r\n\r\n" \
+          "#{partial}"
+        )
+        socket.close
       else
         send_response(socket, *response_for(scenario, request_number))
         if scenario == "interrupt-tool" && request_number.zero?

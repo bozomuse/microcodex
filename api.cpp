@@ -141,6 +141,19 @@ namespace {
         return error == turn_usage_limit_error;
     }
 
+    // receiveResponseBody marks terminal SSE verdicts (response.failed,
+    // response.incomplete, error events, malformed events) with this prefix
+    // so the retry loop can tell them apart from transport failures.
+    constexpr std::string_view stream_error_prefix = "Stream error: ";
+
+    bool isStreamError(std::string &error) {
+        if (error.starts_with(stream_error_prefix)) {
+            error.erase(0, stream_error_prefix.size());
+            return true;
+        }
+        return false;
+    }
+
     bool isToolRoundLimitError(const std::string_view error) {
         return error == tool_round_limit_error;
     }
@@ -148,6 +161,10 @@ namespace {
     struct StreamState {
         microcodex::CodexApiResponse response;
         std::vector<std::string> output_items;
+        // TextDelta events are buffered per attempt and published only when
+        // the attempt is terminal: a retried attempt replays its deltas on
+        // success, and one-way sinks like stdout cannot deduplicate.
+        std::vector<microcodex::CodexEvent> pending_deltas;
         std::string fallback_text;
         std::string line_buffer;
         std::string event_data;
@@ -157,11 +174,11 @@ namespace {
         bool completed = false;
     };
 
-    void emitTextDelta(StreamState &state, const std::string_view text) {
-        if (state.events == nullptr || text.empty()) {
+    void queueTextDelta(StreamState &state, const std::string_view text) {
+        if (text.empty()) {
             return;
         }
-        state.events->emit({
+        state.pending_deltas.push_back({
             .type = microcodex::CodexEventType::TextDelta,
             .turn_id = state.turn_id,
             .call_id = {},
@@ -169,6 +186,18 @@ namespace {
             .text = std::string(text),
             .edit = {},
         });
+    }
+
+    // Publishes the buffered deltas when the attempt is terminal. Failed
+    // attempts that will be retried never flush, so their deltas cannot be
+    // shown twice.
+    void flushTextDeltas(StreamState &state) {
+        if (state.events != nullptr) {
+            for (const auto &event : state.pending_deltas) {
+                state.events->emit(event);
+            }
+        }
+        state.pending_deltas.clear();
     }
 
     std::expected<void, std::string> handleEvent(const std::string_view data, StreamState &state) {
@@ -187,7 +216,7 @@ namespace {
                 return std::unexpected(delta.error());
             }
             state.response.text += *delta;
-            emitTextDelta(state, *delta);
+            queueTextDelta(state, *delta);
             return {};
         }
 
@@ -243,7 +272,7 @@ namespace {
             // only the final message item. Emit that fallback exactly once.
             if (state.response.text.empty() && !state.fallback_text.empty()) {
                 state.response.text = state.fallback_text;
-                emitTextDelta(state, state.fallback_text);
+                queueTextDelta(state, state.fallback_text);
             }
             auto usage = findJsonMember(**response, "usage");
             if (usage && *usage) {
@@ -361,7 +390,11 @@ namespace {
     }
 
     std::expected<void, std::string> receiveResponseBody(const std::string_view data, void *user_data) {
-        return consumeSse(data, *static_cast<StreamState *>(user_data));
+        auto handled = consumeSse(data, *static_cast<StreamState *>(user_data));
+        if (!handled) {
+            return std::unexpected(std::string(stream_error_prefix) + handled.error());
+        }
+        return {};
     }
 
     std::string trim(std::string_view value) {
@@ -990,8 +1023,10 @@ namespace microcodex {
                 .stop_token = stop_token,
             }, receiveResponseBody, receiveResponseHeader, &state);
             if (!response) {
+                std::string error = response.error();
+                const bool stream_error = isStreamError(error);
                 const bool interrupted = stop_token.stop_requested();
-                const bool usage_limited = isTurnUsageLimitError(response.error());
+                const bool usage_limited = isTurnUsageLimitError(error);
                 if ((interrupted || usage_limited) && partial_response != nullptr) {
                     // Cancellation and response limits are resumable: preserve all
                     // complete items and streamed text received before termination.
@@ -1002,15 +1037,27 @@ namespace microcodex {
                     };
                 }
                 if (interrupted) {
+                    flushTextDeltas(state);
                     return std::unexpected(std::string(interrupted_message));
                 }
                 if (usage_limited) {
-                    return std::unexpected(response.error());
+                    // The streamed text is genuine model output: publish it,
+                    // then return the limit verdict without retrying.
+                    flushTextDeltas(state);
+                    return std::unexpected(error);
+                }
+                if (stream_error) {
+                    // Terminal SSE verdicts (response.failed, incomplete, error
+                    // events) are server decisions, not transport glitches:
+                    // retrying cannot change them, so return immediately.
+                    flushTextDeltas(state);
+                    return std::unexpected(error);
                 }
                 // Transport errors are transient: back off and resend the
                 // identical request. Partial output from a failed attempt is
-                // discarded; a successful retry replays the full response.
-                last_error = response.error();
+                // discarded (its buffered deltas were never published); a
+                // successful retry replays the full response.
+                last_error = error;
                 continue;
             }
             if (response->status < 200 || response->status >= 300) {
@@ -1024,12 +1071,15 @@ namespace microcodex {
 
             auto final_event = finishSse(state);
             if (!final_event) {
+                flushTextDeltas(state);
                 return std::unexpected(final_event.error());
             }
             if (!state.completed) {
+                flushTextDeltas(state);
                 return std::unexpected("Codex stream closed before response.completed");
             }
 
+            flushTextDeltas(state);
             return ModelResponse{
                 .response = std::move(state.response),
                 .output_items = std::move(state.output_items),
