@@ -103,3 +103,38 @@ Hello, world!
 STDOUT
 STDERR
 check_saved_token "T9.4: refreshed token is persisted to auth.json" "$expired_home/auth.json"
+
+# T9.5: when the proactive refresh fails (the refresh endpoint is down), the
+# turn still goes out with the stored token instead of failing. The stored
+# token is left untouched in auth.json; the startup warning is the only trace
+# of the failed refresh.
+fallback_home=$TEST_WORKDIR/fallback-home
+mkdir -p "$fallback_home" || exit 1
+cat > "$fallback_home/auth.json" <<EOF
+{
+  "auth_mode": "chatgpt",
+  "tokens": {
+    "id_token": "test-id-token",
+    "access_token": "$expired_jwt",
+    "refresh_token": "test-refresh-token",
+    "account_id": "test-account"
+  }
+}
+EOF
+chmod 600 "$fallback_home/auth.json"
+
+expect_process "T9.5: failed proactive refresh falls back to the stored token" 0 \
+    run_with_mock token-refresh-fallback env -u OPENAI_API_KEY CODEX_HOME="$fallback_home" \
+        PATH="$TEST_BIN_DIR:$PATH" \
+        microcodex Fallback after failed refresh <<'STDOUT' 3<<'STDERR'
+Hello, world!
+STDOUT
+Warning: OAuth token endpoint returned HTTP 400: refresh_failed
+STDERR
+tests_run=$((tests_run + 1))
+if grep -q '"access_token": "refreshed-access-token"' "$fallback_home/auth.json"; then
+    tests_failed=$((tests_failed + 1))
+    printf 'not ok %03d - %s\n' "$tests_run" "T9.5: auth.json was overwritten despite the failed refresh"
+else
+    printf 'ok %03d - %s\n' "$tests_run" "T9.5: auth.json keeps the stored token after a failed refresh"
+fi

@@ -69,6 +69,10 @@ def validate_common!(request_line, headers, payload, bearer, account_id)
 
 end
 
+# Unsigned JWT with payload {"exp":1000000000} (2001-09-09): always past its
+# expiry. Must match the expired_jwt in tests/009-auth-refresh.sh.
+EXPIRED_JWT = "eyJhbGciOiJub25lIn0.eyJleHAiOjEwMDAwMDAwMDB9.c2ln"
+
 # Bearer token expected on POST /responses, by scenario and request index.
 def responses_bearer(scenario, request_number)
   case scenario
@@ -76,6 +80,8 @@ def responses_bearer(scenario, request_number)
     request_number.zero? ? "test-access-token" : "refreshed-access-token"
   when "token-refresh-expired"
     "refreshed-access-token"
+  when "token-refresh-fallback"
+    EXPIRED_JWT
   when "api-key"
     ENV.fetch("MICROCODEX_TEST_BEARER", "test-access-token")
   else
@@ -87,6 +93,8 @@ def models_bearer(scenario)
   case scenario
   when "token-refresh-expired"
     "refreshed-access-token"
+  when "token-refresh-fallback"
+    EXPIRED_JWT
   when "api-key"
     ENV.fetch("MICROCODEX_TEST_BEARER", "test-access-token")
   else
@@ -140,9 +148,9 @@ def validate_scenario!(scenario, request_number, payload)
            "resumed request did not include the aborted turn marker")
   when "stream-error", "stream-drop"
     validate_coding_tools!(payload)
-  when "token-refresh-401", "token-refresh-expired"
+  when "token-refresh-401", "token-refresh-expired", "token-refresh-fallback"
     validate_coding_tools!(payload)
-    assert(input_text(payload) == "Refresh the token",
+    assert(input_text(payload) == (scenario == "token-refresh-fallback" ? "Fallback after failed refresh" : "Refresh the token"),
            "token refresh scenario did not receive its prompt")
   when "api-key"
     validate_coding_tools!(payload)
@@ -490,7 +498,7 @@ def response_for(scenario, request_number)
     else
       [200, "OK", "text/event-stream", text_response]
     end
-  when "token-refresh-expired", "api-key"
+  when "token-refresh-expired", "token-refresh-fallback", "api-key"
     [200, "OK", "text/event-stream", text_response]
   when "tool-write"
     [200, "OK", "text/event-stream",
@@ -623,7 +631,7 @@ while request_number < expected_requests
       request_line, headers, body, payload = read_request(socket)
       FileUtils.mkdir_p(request_directory)
       if request_line.start_with?("POST /oauth/token")
-        assert(scenario == "token-refresh-401" || scenario == "token-refresh-expired",
+        assert(%w[token-refresh-401 token-refresh-expired token-refresh-fallback].include?(scenario),
                "unexpected OAuth token request in scenario #{scenario.inspect}")
         assert(payload["grant_type"] == "refresh_token",
                "refresh did not use the refresh_token grant")
@@ -631,6 +639,13 @@ while request_number < expected_requests
                "refresh did not send the stored refresh token")
         assert(payload["client_id"] && !payload["client_id"].empty?,
                "refresh omitted the client ID")
+        if scenario == "token-refresh-fallback"
+          # The refresh endpoint is down: the CLI must proceed with the
+          # stored token instead of failing the turn.
+          send_response(socket, 400, "Bad Request", "application/json",
+                        JSON.generate(error: "refresh_failed"))
+          next
+        end
         send_response(socket, 200, "OK", "application/json",
                       JSON.generate(access_token: "refreshed-access-token"))
         next

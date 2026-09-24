@@ -986,11 +986,13 @@ namespace microcodex {
 
     std::expected<CodexApi::ModelResponse, std::string> CodexApi::performRequest(std::string request_body, const std::stop_token stop_token, const std::string_view turn_id, const bool emit_events, ModelResponse *partial_response) {
         // Refresh before sending when the stored token is already past its
-        // expiry, so a long-lived session does not waste a round trip.
-        auto proactively_refreshed = refreshAccessTokenIfExpired();
-        if (!proactively_refreshed) {
-            return std::unexpected(proactively_refreshed.error());
-        }
+        // expiry, so a long-lived session does not waste a round trip. A
+        // failed proactive refresh is not fatal: the stored token may still
+        // be accepted (clock skew between the JWT check and the server), and
+        // a genuinely expired token is caught by the 401-driven refresh
+        // below. This mirrors the warn-and-proceed behavior at startup in
+        // main().
+        static_cast<void>(refreshAccessTokenIfExpired());
 
         for (int attempt = 0;; ++attempt) {
             std::vector<std::string> headers{
