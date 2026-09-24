@@ -35,9 +35,20 @@ namespace microcodex {
 
     using HttpDataHandler = std::expected<void, std::string> (*)(std::string_view data, void *user_data);
 
+    // True when a libcurl/LibreSSL/OpenSSL transport error detail describes a
+    // transient TLS or network failure that is safe to retry (for example
+    // SSL_read / sslv3 alert bad record mac on macOS LibreSSL).
+    bool isTransientHttpTransportError(std::string_view detail);
+
+    // Stable failure text for transport errors. Transient TLS failures are
+    // mapped to a generic message so raw LibreSSL/OpenSSL strings are not
+    // surfaced as fatal turn failures.
+    std::string httpTransportFailureMessage(std::string_view detail);
+
     // Performs one synchronous request. Callers may consume body and header
     // chunks as they arrive; a bounded body copy is retained for errors and
-    // non-streaming responses.
+    // non-streaming responses. Transient TLS/network failures are retried with
+    // exponential backoff when no response body bytes have been delivered yet.
     std::expected<HttpResponse, std::string> performHttpRequest(const HttpRequest &request, HttpDataHandler body_handler = nullptr, HttpDataHandler header_handler = nullptr, void *user_data = nullptr);
 
 } // namespace microcodex
