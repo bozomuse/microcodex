@@ -7,9 +7,10 @@
 require "pty"
 require "timeout"
 
-abort "usage: queue-ui.rb APP PROMPT FIRST_REQUEST QUEUED_DONE" unless ARGV.length == 4
+abort "usage: queue-ui.rb APP PROMPT FIRST_REQUEST QUEUED_DONE [quit]" unless (4..5).include?(ARGV.length)
 
 app, prompt, first_request_file, queued_done_file = ARGV
+quit_after_queue = ARGV[4] == "quit"
 
 # GitHub Actions does not set TERM for non-interactive steps. The application
 # still runs inside a real PTY here, so provide a matching terminal type when
@@ -33,6 +34,17 @@ PTY.spawn(app) do |reader, writer, pid|
   Timeout.timeout(10) { sleep 0.02 until File.exist?(first_request_file) }
   writer.write("Queued one\r")
   writer.flush
+  if quit_after_queue
+    # Quit while the turn is still executing: the queued message must be
+    # discarded, never sent. PTY input is a FIFO byte stream, so the Enter
+    # above is processed (and queued) before the Ctrl+Q below.
+    sleep 0.3
+    writer.write("\x11")
+    writer.flush
+    _, status = Process.wait2(pid)
+    drain.join
+    exit(status.exitstatus || 1)
+  end
   sleep 0.1
   writer.write("Queued two\r")
   writer.flush

@@ -305,6 +305,10 @@ def validate_scenario!(scenario, request_number, payload)
                "context-error retry did not install the summary")
       end
     end
+  when "message-queue-quit"
+    validate_coding_tools!(payload)
+    assert(request_number.zero? && input_text(payload) == "Start message queue test",
+           "queue-quit scenario did not receive its first prompt")
   when "message-queue"
     validate_coding_tools!(payload)
     input = payload.fetch("input")
@@ -475,6 +479,8 @@ def response_for(scenario, request_number)
   when "message-queue"
     [200, "OK", "text/event-stream",
      message_response(request_number.zero? ? "First reply" : "Queued reply")]
+  when "message-queue-quit"
+    [200, "OK", "text/event-stream", message_response("First reply")]
   when "interrupt-tool"
     [200, "OK", "text/event-stream",
      request_number.zero? ? sleep_call_response : message_response("Continued after tool interruption")]
@@ -541,6 +547,9 @@ expected_requests = if scenario == "context-error-retry"
                       1
                     elsif scenario == "message-queue"
                       3
+                    elsif scenario == "message-queue-quit"
+                      # The client quits mid-turn: only the first request may arrive.
+                      1
                     elsif scenario == "tool-round-limit"
                       TOOL_ROUND_LIMIT + 2
                     elsif %w[tool-write tool-edit tool-shell-env tool-bash-denied compaction-resume incomplete-output interrupt-output interrupt-tool].include?(scenario)
@@ -574,12 +583,19 @@ while request_number < expected_requests
                     "#{request_line}\r\n#{headers.inspect}\r\n\r\n#{body}")
       validate_common!(request_line, headers, payload)
       validate_scenario!(scenario, request_number, payload)
-      if scenario == "message-queue" && request_number.zero?
+      if %w[message-queue message-queue-quit].include?(scenario) && request_number.zero?
         # Hold the first turn open so the driver can type mid-turn input;
-        # both Enter presses must land while the turn is still executing.
+        # the Enter presses must land while the turn is still executing.
         File.write(File.join(request_directory, "first-request"), "ready\n")
         sleep 2.5
-        send_response(socket, *response_for(scenario, request_number))
+        begin
+          send_response(socket, *response_for(scenario, request_number))
+        rescue StandardError
+          # message-queue-quit: the client quit mid-turn and closed the
+          # connection; the queued message was discarded, so no further
+          # request will ever arrive.
+          raise unless scenario == "message-queue-quit"
+        end
       elsif scenario == "interrupt-output" && request_number.zero?
         socket.write(
           "HTTP/1.1 200 OK\r\n" \
