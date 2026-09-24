@@ -461,6 +461,7 @@ int main(const int argc, char *argv[]) {
     auto config = microcodex::makeCodingAgentConfig(std::move(request->model));
     config.reasoning_effort = std::move(request->reasoning_effort);
     config.resume_conversation = std::move(resume_path);
+    microcodex::applyOAuthCredentials(config, **credentials);
     config.oauth_credentials = **credentials;
     config.oauth_options = std::move(oauth_options);
     // Validate the effort before any network attempt so a bad value fails
