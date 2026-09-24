@@ -22,6 +22,7 @@
 #include <stop_token>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -39,6 +40,29 @@ namespace {
         "The Codex response was incomplete: max_output_tokens";
     constexpr std::string_view tool_round_limit_error =
         "Codex exceeded the maximum number of tool rounds";
+
+    // Transient remote failures (HTTP 5xx, transport errors) are retried with
+    // exponential backoff instead of killing the turn: 1s, 2s, 4s between the
+    // four attempts. Anything else (4xx, usage limits, interruption) keeps its
+    // existing terminal behavior.
+    constexpr std::size_t maximum_request_attempts = 4;
+    constexpr std::chrono::milliseconds retry_base_delay{1000};
+    constexpr std::chrono::milliseconds retry_max_delay{8000};
+
+    bool isTransientHttpStatus(const long status) {
+        return status >= 500 && status < 600;
+    }
+
+    // Sleeps up to `delay`, returning false early when stop is requested so
+    // interruption stays responsive while backing off.
+    bool sleepInterruptible(const std::stop_token stop_token, const std::chrono::milliseconds delay) {
+        const auto deadline = std::chrono::steady_clock::now() + delay;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (stop_token.stop_requested()) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+        return !stop_token.stop_requested();
+    }
     std::string turnAbortedItem(const std::string_view error) {
         return microcodex::userMessageItem(
             "<turn_aborted>\n" + std::string(error) + "\n</turn_aborted>");
@@ -939,51 +963,85 @@ namespace microcodex {
         if (!config_.account_id.empty()) headers.push_back("ChatGPT-Account-ID: " + config_.account_id);
         if (emit_events && !turn_state_.empty()) headers.push_back("x-codex-turn-state: " + turn_state_);
 
-        StreamState state;
-        state.turn_id = std::string(turn_id);
-        state.events = emit_events ? events_ : nullptr;
-        auto response = performHttpRequest({
-            .method = HttpMethod::Post,
-            .url = config_.endpoint,
-            .headers = headers,
-            .body = request_body,
-            .idle_timeout_seconds = config_.idle_timeout_seconds,
-            .total_timeout_seconds = 0,
-            .maximum_response_bytes = 64 * 1024,
-            .stop_token = stop_token,
-        }, receiveResponseBody, receiveResponseHeader, &state);
-        if (!response) {
-            const bool interrupted = stop_token.stop_requested();
-            const bool usage_limited = isTurnUsageLimitError(response.error());
-            if ((interrupted || usage_limited) && partial_response != nullptr) {
-                // Cancellation and response limits are resumable: preserve all
-                // complete items and streamed text received before termination.
-                *partial_response = ModelResponse{
-                    .response = std::move(state.response),
-                    .output_items = std::move(state.output_items),
-                    .turn_state = std::move(state.turn_state),
-                };
-            }
-            if (interrupted) {
+        std::string last_error;
+        for (std::size_t attempt = 0; attempt < maximum_request_attempts; ++attempt) {
+            if (stop_token.stop_requested()) {
                 return std::unexpected(std::string(interrupted_message));
             }
-            return std::unexpected(response.error());
-        }
-        if (response->status < 200 || response->status >= 300) return std::unexpected(responseErrorMessage(response->body, response->status));
+            if (attempt > 0) {
+                auto delay = retry_base_delay * (std::size_t{1} << (attempt - 1));
+                if (delay > retry_max_delay) delay = retry_max_delay;
+                if (!sleepInterruptible(stop_token, delay)) {
+                    return std::unexpected(std::string(interrupted_message));
+                }
+            }
 
-        auto final_event = finishSse(state);
-        if (!final_event) {
-            return std::unexpected(final_event.error());
-        }
-        if (!state.completed) {
-            return std::unexpected("Codex stream closed before response.completed");
+            StreamState state;
+            state.turn_id = std::string(turn_id);
+            state.events = emit_events ? events_ : nullptr;
+            auto response = performHttpRequest({
+                .method = HttpMethod::Post,
+                .url = config_.endpoint,
+                .headers = headers,
+                .body = request_body,
+                .idle_timeout_seconds = config_.idle_timeout_seconds,
+                .total_timeout_seconds = 0,
+                .maximum_response_bytes = 64 * 1024,
+                .stop_token = stop_token,
+            }, receiveResponseBody, receiveResponseHeader, &state);
+            if (!response) {
+                const bool interrupted = stop_token.stop_requested();
+                const bool usage_limited = isTurnUsageLimitError(response.error());
+                if ((interrupted || usage_limited) && partial_response != nullptr) {
+                    // Cancellation and response limits are resumable: preserve all
+                    // complete items and streamed text received before termination.
+                    *partial_response = ModelResponse{
+                        .response = std::move(state.response),
+                        .output_items = std::move(state.output_items),
+                        .turn_state = std::move(state.turn_state),
+                    };
+                }
+                if (interrupted) {
+                    return std::unexpected(std::string(interrupted_message));
+                }
+                if (usage_limited) {
+                    return std::unexpected(response.error());
+                }
+                // Transport errors are transient: back off and resend the
+                // identical request. Partial output from a failed attempt is
+                // discarded; a successful retry replays the full response.
+                last_error = response.error();
+                continue;
+            }
+            if (response->status < 200 || response->status >= 300) {
+                if (isTransientHttpStatus(response->status)) {
+                    // HTTP 5xx is transient: back off and resend.
+                    last_error = responseErrorMessage(response->body, response->status);
+                    continue;
+                }
+                return std::unexpected(responseErrorMessage(response->body, response->status));
+            }
+
+            auto final_event = finishSse(state);
+            if (!final_event) {
+                return std::unexpected(final_event.error());
+            }
+            if (!state.completed) {
+                return std::unexpected("Codex stream closed before response.completed");
+            }
+
+            return ModelResponse{
+                .response = std::move(state.response),
+                .output_items = std::move(state.output_items),
+                .turn_state = std::move(state.turn_state),
+            };
         }
 
-        return ModelResponse{
-            .response = std::move(state.response),
-            .output_items = std::move(state.output_items),
-            .turn_state = std::move(state.turn_state),
-        };
+        // Retries exhausted: fail gracefully. The caller keeps the pre-turn
+        // conversation intact (sendUserMessage rolls back transactionally), so
+        // the user can continue instead of losing state.
+        return std::unexpected("Codex API request failed after " + std::to_string(maximum_request_attempts) +
+                               " attempts: " + last_error);
     }
 
     std::expected<std::string, std::string> CodexApi::requestSummary(const std::span<const std::string> items, const std::stop_token stop_token) {
