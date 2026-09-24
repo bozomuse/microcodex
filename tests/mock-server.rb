@@ -305,6 +305,25 @@ def validate_scenario!(scenario, request_number, payload)
                "context-error retry did not install the summary")
       end
     end
+  when "message-queue"
+    validate_coding_tools!(payload)
+    input = payload.fetch("input")
+    if request_number.zero?
+      assert(input_text(payload) == "Start message queue test",
+             "queue scenario did not receive its first prompt")
+    elsif request_number == 1
+      assert(input.any? { |item| item["role"] == "assistant" &&
+                                item.dig("content", 0, "text") == "First reply" },
+             "queued request was sent before the first turn completed")
+      assert(input.last.dig("content", 0, "text") == "Queued one",
+             "first queued message was not delivered in order")
+    else
+      assert(input.any? { |item| item["role"] == "user" &&
+                                item.dig("content", 0, "text") == "Queued one" },
+             "second queued request lost the first queued message")
+      assert(input.last.dig("content", 0, "text") == "Queued two",
+             "second queued message was not delivered in order")
+    end
   else
     raise "unknown mock scenario #{scenario.inspect}"
   end
@@ -453,6 +472,9 @@ def response_for(scenario, request_number)
     [200, "OK", "text/event-stream", body]
   when "interrupt-output"
     [200, "OK", "text/event-stream", message_response("Continued partial answer")]
+  when "message-queue"
+    [200, "OK", "text/event-stream",
+     message_response(request_number.zero? ? "First reply" : "Queued reply")]
   when "interrupt-tool"
     [200, "OK", "text/event-stream",
      request_number.zero? ? sleep_call_response : message_response("Continued after tool interruption")]
@@ -517,6 +539,8 @@ expected_requests = if scenario == "context-error-retry"
                       3
                     elsif %w[stream-drop stream-error remote-503 remote-continue].include?(scenario)
                       1
+                    elsif scenario == "message-queue"
+                      3
                     elsif scenario == "tool-round-limit"
                       TOOL_ROUND_LIMIT + 2
                     elsif %w[tool-write tool-edit tool-shell-env tool-bash-denied compaction-resume incomplete-output interrupt-output interrupt-tool].include?(scenario)
@@ -550,7 +574,13 @@ while request_number < expected_requests
                     "#{request_line}\r\n#{headers.inspect}\r\n\r\n#{body}")
       validate_common!(request_line, headers, payload)
       validate_scenario!(scenario, request_number, payload)
-      if scenario == "interrupt-output" && request_number.zero?
+      if scenario == "message-queue" && request_number.zero?
+        # Hold the first turn open so the driver can type mid-turn input;
+        # both Enter presses must land while the turn is still executing.
+        File.write(File.join(request_directory, "first-request"), "ready\n")
+        sleep 2.5
+        send_response(socket, *response_for(scenario, request_number))
+      elsif scenario == "interrupt-output" && request_number.zero?
         socket.write(
           "HTTP/1.1 200 OK\r\n" \
           "Content-Type: text/event-stream\r\n" \
@@ -590,6 +620,8 @@ while request_number < expected_requests
           File.write(File.join(request_directory, "limit-ready"), "ready\n")
         elsif scenario == "tool-round-limit" && request_number == TOOL_ROUND_LIMIT + 1
           File.write(File.join(request_directory, "continued"), "continued\n")
+        elsif scenario == "message-queue" && request_number == 2
+          File.write(File.join(request_directory, "queued-done"), "done\n")
         elsif %w[incomplete-output interrupt-output interrupt-tool].include?(scenario) && request_number == 1
           File.write(File.join(request_directory, "continued"), "continued\n")
         end
