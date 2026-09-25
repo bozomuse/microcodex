@@ -87,8 +87,13 @@ def validate_scenario!(scenario, request_number, payload)
            "shared Codex skill path was not added to the prompt")
   when "http-error"
     validate_coding_tools!(payload)
-  when "transient-503", "persistent-503"
+  when "remote-503"
     validate_coding_tools!(payload)
+  when "remote-continue"
+    validate_coding_tools!(payload)
+    inputs = payload.fetch("input")
+    assert(inputs.any? { |item| item.dig("content", 0, "text")&.include?("<turn_aborted>") },
+           "resumed request did not include the aborted turn marker")
   when "stream-error", "stream-drop"
     validate_coding_tools!(payload)
   when "paste"
@@ -409,16 +414,11 @@ def response_for(scenario, request_number)
   when "http-error"
     [429, "Too Many Requests", "application/json",
      JSON.generate(error: {message: "rate limited"})]
-  when "transient-503"
-    if request_number < 2
-      [503, "Service Unavailable", "application/json",
-       JSON.generate(error: {message: "service unavailable"})]
-    else
-      [200, "OK", "text/event-stream", message_response("Recovered after retry")]
-    end
-  when "persistent-503"
+  when "remote-503"
     [503, "Service Unavailable", "application/json",
      JSON.generate(error: {message: "service unavailable"})]
+  when "remote-continue"
+    [200, "OK", "text/event-stream", message_response("Continued after remote failure")]
   when "stream-error"
     [200, "OK", "text/event-stream",
      sse(
@@ -426,10 +426,11 @@ def response_for(scenario, request_number)
        {type: "response.failed", response: {error: {message: "boom"}}}
      )]
   when "stream-drop"
-    # The first attempt drops mid-stream (handled below with an abrupt
-    # close); only the retry gets a full response.
+    # The connection drops mid-stream after partial text: the client must
+    # treat this as a transport failure, preserve the partial text, mark the
+    # turn aborted, and return control without retrying.
     [200, "OK", "text/event-stream",
-     message_response("Recovered without duplication")]
+     message_response("unreachable")]
   when "tool-write"
     [200, "OK", "text/event-stream",
      request_number.zero? ? tool_call_response : tool_final_response]
@@ -514,14 +515,8 @@ abort "usage: mock-server.rb SCENARIO PORT_FILE REQUEST_DIR" unless ARGV.length 
 scenario, port_file, request_directory = ARGV
 expected_requests = if scenario == "context-error-retry"
                       3
-                    elsif scenario == "stream-drop"
-                      2
-                    elsif scenario == "stream-error"
+                    elsif %w[stream-drop stream-error remote-503 remote-continue].include?(scenario)
                       1
-                    elsif scenario == "transient-503"
-                      3
-                    elsif scenario == "persistent-503"
-                      4
                     elsif scenario == "tool-round-limit"
                       TOOL_ROUND_LIMIT + 2
                     elsif %w[tool-write tool-edit tool-shell-env tool-bash-denied compaction-resume incomplete-output interrupt-output interrupt-tool].include?(scenario)
@@ -574,8 +569,9 @@ while request_number < expected_requests
         end
       elsif scenario == "stream-drop" && request_number.zero?
         # Declare more bytes than sent, then drop the connection: the client
-        # must treat this as a transport failure and retry.
-        partial = sse(type: "response.output_text.delta", delta: "Partial then drop")
+        # must treat this as a transport failure and abort the turn without
+        # retrying.
+        partial = sse(type: "response.output_text.delta", delta: "Partial then drop\n")
         socket.write(
           "HTTP/1.1 200 OK\r\n" \
           "Content-Type: text/event-stream\r\n" \

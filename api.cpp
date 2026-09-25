@@ -22,7 +22,6 @@
 #include <stop_token>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -40,29 +39,6 @@ namespace {
         "The Codex response was incomplete: max_output_tokens";
     constexpr std::string_view tool_round_limit_error =
         "Codex exceeded the maximum number of tool rounds";
-
-    // Transient remote failures (HTTP 5xx, transport errors) are retried with
-    // exponential backoff instead of killing the turn: 1s, 2s, 4s between the
-    // four attempts. Anything else (4xx, usage limits, interruption) keeps its
-    // existing terminal behavior.
-    constexpr std::size_t maximum_request_attempts = 4;
-    constexpr std::chrono::milliseconds retry_base_delay{1000};
-    constexpr std::chrono::milliseconds retry_max_delay{8000};
-
-    bool isTransientHttpStatus(const long status) {
-        return status >= 500 && status < 600;
-    }
-
-    // Sleeps up to `delay`, returning false early when stop is requested so
-    // interruption stays responsive while backing off.
-    bool sleepInterruptible(const std::stop_token stop_token, const std::chrono::milliseconds delay) {
-        const auto deadline = std::chrono::steady_clock::now() + delay;
-        while (std::chrono::steady_clock::now() < deadline) {
-            if (stop_token.stop_requested()) return false;
-            std::this_thread::sleep_for(std::chrono::milliseconds(25));
-        }
-        return !stop_token.stop_requested();
-    }
     std::string turnAbortedItem(const std::string_view error) {
         return microcodex::userMessageItem(
             "<turn_aborted>\n" + std::string(error) + "\n</turn_aborted>");
@@ -141,30 +117,31 @@ namespace {
         return error == turn_usage_limit_error;
     }
 
-    // receiveResponseBody marks terminal SSE verdicts (response.failed,
-    // response.incomplete, error events, malformed events) with this prefix
-    // so the retry loop can tell them apart from transport failures.
-    constexpr std::string_view stream_error_prefix = "Stream error: ";
-
-    bool isStreamError(std::string &error) {
-        if (error.starts_with(stream_error_prefix)) {
-            error.erase(0, stream_error_prefix.size());
-            return true;
-        }
-        return false;
-    }
-
     bool isToolRoundLimitError(const std::string_view error) {
         return error == tool_round_limit_error;
+    }
+
+    // Remote/transport failures (HTTP 5xx, curl-level transport errors) are
+    // resumable like interruptions and usage limits: the turn keeps whatever
+    // partial output arrived before the failure, gains a <turn_aborted>
+    // marker, and the user can continue from there. 4xx responses and
+    // terminal stream verdicts stay transactional.
+    bool isTransportFailureError(const std::string_view error) {
+        return error.starts_with("HTTP request failed: ");
+    }
+
+    bool isServerErrorStatus(const long status) {
+        return status >= 500 && status < 600;
+    }
+
+    bool isRemoteFailureError(const std::string_view error) {
+        return isTransportFailureError(error) ||
+               error.starts_with("Codex API returned HTTP 5");
     }
 
     struct StreamState {
         microcodex::CodexApiResponse response;
         std::vector<std::string> output_items;
-        // TextDelta events are buffered per attempt and published only when
-        // the attempt is terminal: a retried attempt replays its deltas on
-        // success, and one-way sinks like stdout cannot deduplicate.
-        std::vector<microcodex::CodexEvent> pending_deltas;
         std::string fallback_text;
         std::string line_buffer;
         std::string event_data;
@@ -174,11 +151,11 @@ namespace {
         bool completed = false;
     };
 
-    void queueTextDelta(StreamState &state, const std::string_view text) {
-        if (text.empty()) {
+    void emitTextDelta(StreamState &state, const std::string_view text) {
+        if (state.events == nullptr || text.empty()) {
             return;
         }
-        state.pending_deltas.push_back({
+        state.events->emit({
             .type = microcodex::CodexEventType::TextDelta,
             .turn_id = state.turn_id,
             .call_id = {},
@@ -186,18 +163,6 @@ namespace {
             .text = std::string(text),
             .edit = {},
         });
-    }
-
-    // Publishes the buffered deltas when the attempt is terminal. Failed
-    // attempts that will be retried never flush, so their deltas cannot be
-    // shown twice.
-    void flushTextDeltas(StreamState &state) {
-        if (state.events != nullptr) {
-            for (const auto &event : state.pending_deltas) {
-                state.events->emit(event);
-            }
-        }
-        state.pending_deltas.clear();
     }
 
     std::expected<void, std::string> handleEvent(const std::string_view data, StreamState &state) {
@@ -216,7 +181,7 @@ namespace {
                 return std::unexpected(delta.error());
             }
             state.response.text += *delta;
-            queueTextDelta(state, *delta);
+            emitTextDelta(state, *delta);
             return {};
         }
 
@@ -272,7 +237,7 @@ namespace {
             // only the final message item. Emit that fallback exactly once.
             if (state.response.text.empty() && !state.fallback_text.empty()) {
                 state.response.text = state.fallback_text;
-                queueTextDelta(state, state.fallback_text);
+                emitTextDelta(state, state.fallback_text);
             }
             auto usage = findJsonMember(**response, "usage");
             if (usage && *usage) {
@@ -390,11 +355,7 @@ namespace {
     }
 
     std::expected<void, std::string> receiveResponseBody(const std::string_view data, void *user_data) {
-        auto handled = consumeSse(data, *static_cast<StreamState *>(user_data));
-        if (!handled) {
-            return std::unexpected(std::string(stream_error_prefix) + handled.error());
-        }
-        return {};
+        return consumeSse(data, *static_cast<StreamState *>(user_data));
     }
 
     std::string trim(std::string_view value) {
@@ -581,7 +542,8 @@ namespace microcodex {
             const bool interrupted = turn_stop.stop_requested();
             const bool usage_limited = isTurnUsageLimitError(response.error());
             const bool tool_round_limited = isToolRoundLimitError(response.error());
-            if (interrupted || usage_limited || tool_round_limited) {
+            const bool remote_failed = isRemoteFailureError(response.error());
+            if (interrupted || usage_limited || tool_round_limited || remote_failed) {
                 // Keep every complete response item and partial assistant text.
                 // The marker makes the termination explicit to a later
                 // "continue" while preserving one durable turn boundary.
@@ -956,9 +918,11 @@ namespace microcodex {
         ModelResponse partial;
         auto sampled = performRequest(std::move(*request_body), stop_token, turn_id, true, &partial);
         if (!sampled) {
-            if (stop_token.stop_requested() || isTurnUsageLimitError(sampled.error())) {
-                // Both user cancellation and an API response limit leave useful
-                // model output that the next turn must see in order to continue.
+            if (stop_token.stop_requested() || isTurnUsageLimitError(sampled.error()) ||
+                isRemoteFailureError(sampled.error())) {
+                // User cancellation, API response limits, and remote/transport
+                // failures leave useful model output that the next turn must
+                // see in order to continue.
                 turn_state_ = std::move(partial.turn_state);
                 reported_input_tokens_ = partial.response.input_tokens;
                 bool has_assistant_message = false;
@@ -996,102 +960,65 @@ namespace microcodex {
         if (!config_.account_id.empty()) headers.push_back("ChatGPT-Account-ID: " + config_.account_id);
         if (emit_events && !turn_state_.empty()) headers.push_back("x-codex-turn-state: " + turn_state_);
 
-        std::string last_error;
-        for (std::size_t attempt = 0; attempt < maximum_request_attempts; ++attempt) {
-            if (stop_token.stop_requested()) {
+        StreamState state;
+        state.turn_id = std::string(turn_id);
+        state.events = emit_events ? events_ : nullptr;
+        auto response = performHttpRequest({
+            .method = HttpMethod::Post,
+            .url = config_.endpoint,
+            .headers = headers,
+            .body = request_body,
+            .idle_timeout_seconds = config_.idle_timeout_seconds,
+            .total_timeout_seconds = 0,
+            .maximum_response_bytes = 64 * 1024,
+            .stop_token = stop_token,
+        }, receiveResponseBody, receiveResponseHeader, &state);
+        if (!response) {
+            const bool interrupted = stop_token.stop_requested();
+            const bool usage_limited = isTurnUsageLimitError(response.error());
+            const bool transport_failed = isTransportFailureError(response.error());
+            if ((interrupted || usage_limited || transport_failed) && partial_response != nullptr) {
+                // Cancellation, response limits, and transport failures are
+                // resumable: preserve all complete items and streamed text
+                // received before termination.
+                *partial_response = ModelResponse{
+                    .response = std::move(state.response),
+                    .output_items = std::move(state.output_items),
+                    .turn_state = std::move(state.turn_state),
+                };
+            }
+            if (interrupted) {
                 return std::unexpected(std::string(interrupted_message));
             }
-            if (attempt > 0) {
-                auto delay = retry_base_delay * (std::size_t{1} << (attempt - 1));
-                if (delay > retry_max_delay) delay = retry_max_delay;
-                if (!sleepInterruptible(stop_token, delay)) {
-                    return std::unexpected(std::string(interrupted_message));
-                }
+            return std::unexpected(response.error());
+        }
+        if (response->status < 200 || response->status >= 300) {
+            if (isServerErrorStatus(response->status) && partial_response != nullptr) {
+                // Remote 5xx failures are resumable like interruptions: keep
+                // whatever the model produced before the failure so the next
+                // turn can continue from it.
+                *partial_response = ModelResponse{
+                    .response = std::move(state.response),
+                    .output_items = std::move(state.output_items),
+                    .turn_state = std::move(state.turn_state),
+                };
             }
-
-            StreamState state;
-            state.turn_id = std::string(turn_id);
-            state.events = emit_events ? events_ : nullptr;
-            auto response = performHttpRequest({
-                .method = HttpMethod::Post,
-                .url = config_.endpoint,
-                .headers = headers,
-                .body = request_body,
-                .idle_timeout_seconds = config_.idle_timeout_seconds,
-                .total_timeout_seconds = 0,
-                .maximum_response_bytes = 64 * 1024,
-                .stop_token = stop_token,
-            }, receiveResponseBody, receiveResponseHeader, &state);
-            if (!response) {
-                std::string error = response.error();
-                const bool stream_error = isStreamError(error);
-                const bool interrupted = stop_token.stop_requested();
-                const bool usage_limited = isTurnUsageLimitError(error);
-                if ((interrupted || usage_limited) && partial_response != nullptr) {
-                    // Cancellation and response limits are resumable: preserve all
-                    // complete items and streamed text received before termination.
-                    *partial_response = ModelResponse{
-                        .response = std::move(state.response),
-                        .output_items = std::move(state.output_items),
-                        .turn_state = std::move(state.turn_state),
-                    };
-                }
-                if (interrupted) {
-                    flushTextDeltas(state);
-                    return std::unexpected(std::string(interrupted_message));
-                }
-                if (usage_limited) {
-                    // The streamed text is genuine model output: publish it,
-                    // then return the limit verdict without retrying.
-                    flushTextDeltas(state);
-                    return std::unexpected(error);
-                }
-                if (stream_error) {
-                    // Terminal SSE verdicts (response.failed, incomplete, error
-                    // events) are server decisions, not transport glitches:
-                    // retrying cannot change them, so return immediately.
-                    flushTextDeltas(state);
-                    return std::unexpected(error);
-                }
-                // Transport errors are transient: back off and resend the
-                // identical request. Partial output from a failed attempt is
-                // discarded (its buffered deltas were never published); a
-                // successful retry replays the full response.
-                last_error = error;
-                continue;
-            }
-            if (response->status < 200 || response->status >= 300) {
-                if (isTransientHttpStatus(response->status)) {
-                    // HTTP 5xx is transient: back off and resend.
-                    last_error = responseErrorMessage(response->body, response->status);
-                    continue;
-                }
-                return std::unexpected(responseErrorMessage(response->body, response->status));
-            }
-
-            auto final_event = finishSse(state);
-            if (!final_event) {
-                flushTextDeltas(state);
-                return std::unexpected(final_event.error());
-            }
-            if (!state.completed) {
-                flushTextDeltas(state);
-                return std::unexpected("Codex stream closed before response.completed");
-            }
-
-            flushTextDeltas(state);
-            return ModelResponse{
-                .response = std::move(state.response),
-                .output_items = std::move(state.output_items),
-                .turn_state = std::move(state.turn_state),
-            };
+            return std::unexpected(responseErrorMessage(response->body, response->status));
         }
 
-        // Retries exhausted: fail gracefully. The caller keeps the pre-turn
-        // conversation intact (sendUserMessage rolls back transactionally), so
-        // the user can continue instead of losing state.
-        return std::unexpected("Codex API request failed after " + std::to_string(maximum_request_attempts) +
-                               " attempts: " + last_error);
+        auto final_event = finishSse(state);
+        if (!final_event) {
+            return std::unexpected(final_event.error());
+        }
+        if (!state.completed) {
+            return std::unexpected("Codex stream closed before response.completed");
+        }
+
+        return ModelResponse{
+            .response = std::move(state.response),
+            .output_items = std::move(state.output_items),
+            .turn_state = std::move(state.turn_state),
+        };
     }
 
     std::expected<std::string, std::string> CodexApi::requestSummary(const std::span<const std::string> items, const std::stop_token stop_token) {
