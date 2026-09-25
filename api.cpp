@@ -121,6 +121,24 @@ namespace {
         return error == tool_round_limit_error;
     }
 
+    // Remote/transport failures (HTTP 5xx, curl-level transport errors) are
+    // resumable like interruptions and usage limits: the turn keeps whatever
+    // partial output arrived before the failure, gains a <turn_aborted>
+    // marker, and the user can continue from there. 4xx responses and
+    // terminal stream verdicts stay transactional.
+    bool isTransportFailureError(const std::string_view error) {
+        return error.starts_with("HTTP request failed: ");
+    }
+
+    bool isServerErrorStatus(const long status) {
+        return status >= 500 && status < 600;
+    }
+
+    bool isRemoteFailureError(const std::string_view error) {
+        return isTransportFailureError(error) ||
+               error.starts_with("Codex API returned HTTP 5");
+    }
+
     struct StreamState {
         microcodex::CodexApiResponse response;
         std::vector<std::string> output_items;
@@ -524,7 +542,8 @@ namespace microcodex {
             const bool interrupted = turn_stop.stop_requested();
             const bool usage_limited = isTurnUsageLimitError(response.error());
             const bool tool_round_limited = isToolRoundLimitError(response.error());
-            if (interrupted || usage_limited || tool_round_limited) {
+            const bool remote_failed = isRemoteFailureError(response.error());
+            if (interrupted || usage_limited || tool_round_limited || remote_failed) {
                 // Keep every complete response item and partial assistant text.
                 // The marker makes the termination explicit to a later
                 // "continue" while preserving one durable turn boundary.
@@ -899,9 +918,11 @@ namespace microcodex {
         ModelResponse partial;
         auto sampled = performRequest(std::move(*request_body), stop_token, turn_id, true, &partial);
         if (!sampled) {
-            if (stop_token.stop_requested() || isTurnUsageLimitError(sampled.error())) {
-                // Both user cancellation and an API response limit leave useful
-                // model output that the next turn must see in order to continue.
+            if (stop_token.stop_requested() || isTurnUsageLimitError(sampled.error()) ||
+                isRemoteFailureError(sampled.error())) {
+                // User cancellation, API response limits, and remote/transport
+                // failures leave useful model output that the next turn must
+                // see in order to continue.
                 turn_state_ = std::move(partial.turn_state);
                 reported_input_tokens_ = partial.response.input_tokens;
                 bool has_assistant_message = false;
@@ -955,9 +976,11 @@ namespace microcodex {
         if (!response) {
             const bool interrupted = stop_token.stop_requested();
             const bool usage_limited = isTurnUsageLimitError(response.error());
-            if ((interrupted || usage_limited) && partial_response != nullptr) {
-                // Cancellation and response limits are resumable: preserve all
-                // complete items and streamed text received before termination.
+            const bool transport_failed = isTransportFailureError(response.error());
+            if ((interrupted || usage_limited || transport_failed) && partial_response != nullptr) {
+                // Cancellation, response limits, and transport failures are
+                // resumable: preserve all complete items and streamed text
+                // received before termination.
                 *partial_response = ModelResponse{
                     .response = std::move(state.response),
                     .output_items = std::move(state.output_items),
@@ -969,7 +992,19 @@ namespace microcodex {
             }
             return std::unexpected(response.error());
         }
-        if (response->status < 200 || response->status >= 300) return std::unexpected(responseErrorMessage(response->body, response->status));
+        if (response->status < 200 || response->status >= 300) {
+            if (isServerErrorStatus(response->status) && partial_response != nullptr) {
+                // Remote 5xx failures are resumable like interruptions: keep
+                // whatever the model produced before the failure so the next
+                // turn can continue from it.
+                *partial_response = ModelResponse{
+                    .response = std::move(state.response),
+                    .output_items = std::move(state.output_items),
+                    .turn_state = std::move(state.turn_state),
+                };
+            }
+            return std::unexpected(responseErrorMessage(response->body, response->status));
+        }
 
         auto final_event = finishSse(state);
         if (!final_event) {
