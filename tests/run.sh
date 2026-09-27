@@ -2,6 +2,12 @@
 
 set -u
 
+# The mock suite must be hermetic: a developer's real OPENAI_API_KEY or
+# CODEX_HOME would leak into credential resolution and change behavior.
+# Tests that need credentials opt back in explicitly via `env`.
+unset OPENAI_API_KEY
+unset CODEX_HOME
+
 script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd) || exit 1
 ROOT_DIR=$(CDPATH= cd "$script_dir/.." && pwd) || exit 1
 TEST_DIR=$script_dir

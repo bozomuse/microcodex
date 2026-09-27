@@ -82,6 +82,10 @@ def responses_bearer(scenario, request_number)
     "refreshed-access-token"
   when "token-refresh-fallback"
     EXPIRED_JWT
+  when "token-refresh-fallback-skip"
+    EXPIRED_JWT
+  when "token-refresh-save-fail"
+    "refreshed-access-token"
   when "api-key"
     ENV.fetch("MICROCODEX_TEST_BEARER", "test-access-token")
   else
@@ -95,6 +99,10 @@ def models_bearer(scenario)
     "refreshed-access-token"
   when "token-refresh-fallback"
     EXPIRED_JWT
+  when "token-refresh-fallback-skip"
+    EXPIRED_JWT
+  when "token-refresh-save-fail"
+    "refreshed-access-token"
   when "api-key"
     ENV.fetch("MICROCODEX_TEST_BEARER", "test-access-token")
   else
@@ -180,6 +188,24 @@ def validate_scenario!(scenario, request_number, payload)
     validate_coding_tools!(payload)
     assert(input_text(payload) == (scenario == "token-refresh-fallback" ? "Fallback after failed refresh" : "Refresh the token"),
            "token refresh scenario did not receive its prompt")
+  when "token-refresh-fallback-skip"
+    validate_coding_tools!(payload)
+    if request_number.zero?
+      assert(input_text(payload) == "Trigger a tool call after failed refresh",
+             "fallback-skip scenario did not receive its prompt")
+    else
+      input = payload.fetch("input")
+      assert(input.any? { |item| item["type"] == "function_call" && item["call_id"] == "call_write" },
+             "second request did not replay the function call")
+      assert(input.any? { |item| item == {"type" => "function_call_output",
+                                         "call_id" => "call_write",
+                                         "output" => "Created result.txt"} },
+             "second request did not contain the real tool output")
+    end
+  when "token-refresh-save-fail"
+    validate_coding_tools!(payload)
+    assert(input_text(payload) == "Refresh despite an unwritable credential file",
+           "save-fail scenario did not receive its prompt")
   when "api-key"
     validate_coding_tools!(payload)
     assert(input_text(payload) == "Api key prompt",
@@ -532,6 +558,13 @@ def response_for(scenario, request_number)
     end
   when "token-refresh-expired", "token-refresh-fallback", "api-key"
     [200, "OK", "text/event-stream", text_response]
+  when "token-refresh-save-fail"
+    [200, "OK", "text/event-stream", text_response]
+  when "token-refresh-fallback-skip"
+    # The first request triggers a tool call so the session performs a second
+    # request; the proactive refresh must not be retried for it.
+    request_number.zero? ? [200, "OK", "text/event-stream", tool_call_response] :
+                           [200, "OK", "text/event-stream", tool_final_response]
   when "tool-write"
     [200, "OK", "text/event-stream",
      request_number.zero? ? tool_call_response : tool_final_response]
@@ -645,7 +678,7 @@ expected_requests = if scenario == "context-error-retry"
                       TOOL_ROUND_LIMIT + 2
                     elsif %w[token-refresh-401].include?(scenario)
                       2
-                    elsif %w[tool-write tool-edit tool-shell-env tool-bash-denied compaction-resume incomplete-output interrupt-output interrupt-tool].include?(scenario)
+                    elsif %w[tool-write tool-edit tool-shell-env tool-bash-denied compaction-resume incomplete-output interrupt-output interrupt-tool token-refresh-fallback-skip].include?(scenario)
                       2
                     else
                       1
@@ -655,6 +688,7 @@ File.write(port_file, "#{server.addr[1]}\n")
 
 request_number = 0
 models_requested = false
+token_hits = 0
 while request_number < expected_requests
   socket = nil
   begin
@@ -663,7 +697,8 @@ while request_number < expected_requests
       request_line, headers, body, payload = read_request(socket)
       FileUtils.mkdir_p(request_directory)
       if request_line.start_with?("POST /oauth/token")
-        assert(%w[token-refresh-401 token-refresh-expired token-refresh-fallback].include?(scenario),
+        token_hits += 1
+        assert(%w[token-refresh-401 token-refresh-expired token-refresh-fallback token-refresh-fallback-skip token-refresh-save-fail].include?(scenario),
                "unexpected OAuth token request in scenario #{scenario.inspect}")
         assert(payload["grant_type"] == "refresh_token",
                "refresh did not use the refresh_token grant")
@@ -671,7 +706,7 @@ while request_number < expected_requests
                "refresh did not send the stored refresh token")
         assert(payload["client_id"] && !payload["client_id"].empty?,
                "refresh omitted the client ID")
-        if scenario == "token-refresh-fallback"
+        if %w[token-refresh-fallback token-refresh-fallback-skip].include?(scenario)
           # The refresh endpoint is down: the CLI must proceed with the
           # stored token instead of failing the turn.
           send_response(socket, 400, "Bad Request", "application/json",
@@ -755,3 +790,9 @@ while request_number < expected_requests
   end
 end
 assert(models_requested, "models endpoint was not queried")
+if scenario == "token-refresh-fallback-skip"
+  # One attempt at startup plus one proactive attempt on the first turn; the
+  # second turn must skip the proactive refresh after the first failure.
+  assert(token_hits == 2,
+         "expected 2 token refresh attempts (startup + first turn), saw #{token_hits}")
+end
