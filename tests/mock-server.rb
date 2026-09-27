@@ -84,6 +84,8 @@ def responses_bearer(scenario, request_number)
     EXPIRED_JWT
   when "token-refresh-fallback-skip"
     EXPIRED_JWT
+  when "token-refresh-401-after-failed-proactive"
+    EXPIRED_JWT
   when "token-refresh-save-fail"
     "refreshed-access-token"
   when "api-key"
@@ -100,6 +102,8 @@ def models_bearer(scenario)
   when "token-refresh-fallback"
     EXPIRED_JWT
   when "token-refresh-fallback-skip"
+    EXPIRED_JWT
+  when "token-refresh-401-after-failed-proactive"
     EXPIRED_JWT
   when "token-refresh-save-fail"
     "refreshed-access-token"
@@ -188,6 +192,10 @@ def validate_scenario!(scenario, request_number, payload)
     validate_coding_tools!(payload)
     assert(input_text(payload) == (scenario == "token-refresh-fallback" ? "Fallback after failed refresh" : "Refresh the token"),
            "token refresh scenario did not receive its prompt")
+  when "token-refresh-401-after-failed-proactive"
+    validate_coding_tools!(payload)
+    assert(input_text(payload) == "Refresh fails then the request is unauthorized",
+           "401-after-failed-proactive scenario did not receive its prompt")
   when "token-refresh-fallback-skip"
     validate_coding_tools!(payload)
     if request_number.zero?
@@ -556,6 +564,11 @@ def response_for(scenario, request_number)
     else
       [200, "OK", "text/event-stream", text_response]
     end
+  when "token-refresh-401-after-failed-proactive"
+    # The proactive refresh already failed on this request, so the 401 must
+    # surface directly instead of triggering a second refresh.
+    [401, "Unauthorized", "application/json",
+     JSON.generate(error: {message: "token expired"})]
   when "token-refresh-expired", "token-refresh-fallback", "api-key"
     [200, "OK", "text/event-stream", text_response]
   when "token-refresh-save-fail"
@@ -698,7 +711,7 @@ while request_number < expected_requests
       FileUtils.mkdir_p(request_directory)
       if request_line.start_with?("POST /oauth/token")
         token_hits += 1
-        assert(%w[token-refresh-401 token-refresh-expired token-refresh-fallback token-refresh-fallback-skip token-refresh-save-fail].include?(scenario),
+        assert(%w[token-refresh-401 token-refresh-expired token-refresh-fallback token-refresh-fallback-skip token-refresh-401-after-failed-proactive token-refresh-save-fail].include?(scenario),
                "unexpected OAuth token request in scenario #{scenario.inspect}")
         assert(payload["grant_type"] == "refresh_token",
                "refresh did not use the refresh_token grant")
@@ -706,7 +719,7 @@ while request_number < expected_requests
                "refresh did not send the stored refresh token")
         assert(payload["client_id"] && !payload["client_id"].empty?,
                "refresh omitted the client ID")
-        if %w[token-refresh-fallback token-refresh-fallback-skip].include?(scenario)
+        if %w[token-refresh-fallback token-refresh-fallback-skip token-refresh-401-after-failed-proactive].include?(scenario)
           # The refresh endpoint is down: the CLI must proceed with the
           # stored token instead of failing the turn.
           send_response(socket, 400, "Bad Request", "application/json",
@@ -795,4 +808,10 @@ if scenario == "token-refresh-fallback-skip"
   # second turn must skip the proactive refresh after the first failure.
   assert(token_hits == 2,
          "expected 2 token refresh attempts (startup + first turn), saw #{token_hits}")
+end
+if scenario == "token-refresh-401-after-failed-proactive"
+  # One attempt at startup plus one proactive attempt on the turn; the 401 on
+  # that same request must NOT trigger a second refresh.
+  assert(token_hits == 2,
+         "expected 2 token refresh attempts (startup + proactive), saw #{token_hits}")
 end

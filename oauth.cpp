@@ -533,7 +533,16 @@ namespace {
 
     // Shared token-endpoint transport. The initial code exchange is form encoded,
     // while refresh follows Codex and sends JSON, so content_type stays explicit.
-    std::expected<HttpResponse, std::string> postBody(const std::string &url, const std::string &body, const std::string &content_type, const long timeout_seconds) {
+    // The progress callback aborts the transfer when the stop token fires, so
+    // interrupting a turn also cancels a hung token request. A default (never
+    // signalled) token keeps the historical blocking behavior.
+    int refreshTransferProgress(void *user_data, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+        const auto *token = static_cast<const std::stop_token *>(user_data);
+        return token->stop_requested() ? 1 : 0;
+    }
+
+    std::expected<HttpResponse, std::string> postBody(const std::string &url, const std::string &body, const std::string &content_type, const long timeout_seconds,
+                                                      const std::stop_token &stop_token = {}) {
         if (timeout_seconds <= 0) {
             return std::unexpected("OAuth token request timeout must be greater than zero");
         }
@@ -569,7 +578,9 @@ namespace {
             !setOption(CURLOPT_ERRORBUFFER, curl_error.data()) ||
             !setOption(CURLOPT_USERAGENT, "microcodex") ||
             !setOption(CURLOPT_CONNECTTIMEOUT, timeout_seconds) ||
-            !setOption(CURLOPT_TIMEOUT, timeout_seconds) || !setOption(CURLOPT_NOSIGNAL, 1L)) {
+            !setOption(CURLOPT_TIMEOUT, timeout_seconds) || !setOption(CURLOPT_NOSIGNAL, 1L) ||
+            !setOption(CURLOPT_XFERINFOFUNCTION, &refreshTransferProgress) ||
+            !setOption(CURLOPT_XFERINFODATA, &stop_token) || !setOption(CURLOPT_NOPROGRESS, 0L)) {
             return std::unexpected("Could not configure OAuth token request");
         }
 
@@ -577,6 +588,9 @@ namespace {
         curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &response.status);
         if (!response.callback_error.empty()) {
             return std::unexpected(response.callback_error);
+        }
+        if (result == CURLE_ABORTED_BY_CALLBACK && stop_token.stop_requested()) {
+            return std::unexpected("OAuth token request interrupted");
         }
         if (result != CURLE_OK) {
             const std::string detail = curl_error[0] == '\0'
@@ -1372,7 +1386,7 @@ namespace microcodex {
         return saveOAuthCredentials(credentials, path.value());
     }
 
-    std::expected<OAuthCredentials, std::string> refreshOAuthCredentials(const OAuthCredentials &credentials, OAuthOptions options) {
+    std::expected<OAuthCredentials, std::string> refreshOAuthCredentials(const OAuthCredentials &credentials, OAuthOptions options, std::stop_token stop_token) {
         auto credential_validation = validateCredentials(credentials);
         if (!credential_validation) {
             return std::unexpected(credential_validation.error());
@@ -1390,7 +1404,7 @@ namespace microcodex {
         body += '}';
         auto response =
             postBody(options.issuer + "/oauth/token", body, "Content-Type: application/json",
-                     options.token_request_timeout_seconds);
+                     options.token_request_timeout_seconds, stop_token);
         if (!response) {
             return std::unexpected(response.error());
         }

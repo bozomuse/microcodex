@@ -961,12 +961,12 @@ namespace microcodex {
                !config_.oauth_credentials->refresh_token.empty();
     }
 
-    std::expected<void, std::string> CodexApi::refreshAccessToken() {
+    std::expected<void, std::string> CodexApi::refreshAccessToken(std::stop_token stop_token) {
         if (!canRefreshAccessToken()) {
             return std::unexpected("No OAuth refresh token is available");
         }
         auto refreshed =
-            refreshOAuthCredentials(*config_.oauth_credentials, config_.oauth_options);
+            refreshOAuthCredentials(*config_.oauth_credentials, config_.oauth_options, stop_token);
         if (!refreshed) {
             // The issuer is down or the grant is revoked; a later proactive
             // check would fail the same way, so skip it for the rest of the
@@ -989,7 +989,7 @@ namespace microcodex {
         return {};
     }
 
-    std::expected<void, std::string> CodexApi::refreshAccessTokenIfExpired() {
+    std::expected<void, std::string> CodexApi::refreshAccessTokenIfExpired(std::stop_token stop_token) {
         if (!canRefreshAccessToken() || proactive_refresh_failed_) {
             return {};
         }
@@ -999,7 +999,7 @@ namespace microcodex {
         if (!expired || !*expired) {
             return {};
         }
-        return refreshAccessToken();
+        return refreshAccessToken(stop_token);
     }
 
     std::expected<CodexApi::ModelResponse, std::string> CodexApi::performRequest(std::string request_body, const std::stop_token stop_token, const std::string_view turn_id, const bool emit_events, ModelResponse *partial_response) {
@@ -1010,8 +1010,12 @@ namespace microcodex {
         // a genuinely expired token is caught by the 401-driven refresh
         // below. This mirrors the warn-and-proceed behavior at startup in
         // main(). A proactive refresh that already failed once this session
-        // is skipped rather than retried on every request.
-        static_cast<void>(refreshAccessTokenIfExpired());
+        // is skipped rather than retried on every request. When the proactive
+        // refresh fails on this request, the 401 path below must not start a
+        // second refresh for the same request: the issuer just proved itself
+        // unreachable, so another attempt would only wait out a second
+        // timeout before surfacing the same failure.
+        const bool proactive_failed = !refreshAccessTokenIfExpired(stop_token);
 
         for (int attempt = 0;; ++attempt) {
             std::vector<std::string> headers{
@@ -1062,10 +1066,15 @@ namespace microcodex {
 
             // An expired token is refreshed once and the request retried with
             // the new token. Anything else, including a second 401, surfaces
-            // as an error so a revoked credential cannot loop.
-            if (response->status == 401 && attempt == 0 && canRefreshAccessToken()) {
-                auto refreshed = refreshAccessToken();
+            // as an error so a revoked credential cannot loop. When the
+            // proactive refresh already failed on this request, no second
+            // refresh is attempted: the 401 surfaces directly.
+            if (response->status == 401 && attempt == 0 && canRefreshAccessToken() && !proactive_failed) {
+                auto refreshed = refreshAccessToken(stop_token);
                 if (!refreshed) {
+                    if (stop_token.stop_requested()) {
+                        return std::unexpected(std::string(interrupted_message));
+                    }
                     return std::unexpected(responseErrorMessage(response->body, response->status) +
                                            "; token refresh failed: " + refreshed.error());
                 }

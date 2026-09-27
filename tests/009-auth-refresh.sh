@@ -211,6 +211,31 @@ static int fail_credential_tmp(const char *path) {
     return path != NULL && strstr(path, "auth.json.tmp.") != NULL;
 }
 
+#ifdef __APPLE__
+// macOS uses two-level namespaces: merely redefining open() in an injected
+// dylib does NOT interpose it for other images, so the Linux-style symbol
+// override silently fails and the save succeeds. Register the replacement
+// through the __DATA,__interpose section instead.
+static int my_open(const char *path, int flags, ...) {
+    if (fail_credential_tmp(path)) {
+        errno = EACCES;
+        return -1;
+    }
+    int (*real_open)(const char *, int, ...) = dlsym(RTLD_NEXT, "open");
+    va_list ap;
+    va_start(ap, flags);
+    mode_t mode = va_arg(ap, mode_t);
+    va_end(ap);
+    return real_open(path, flags, mode);
+}
+
+__attribute__((used)) static struct {
+    const void *replacement;
+    const void *replacee;
+} interposers[] __attribute__((section("__DATA,__interpose"))) = {
+    {(const void *)my_open, (const void *)open},
+};
+#else
 int open(const char *path, int flags, ...) {
     if (fail_credential_tmp(path)) {
         errno = EACCES;
@@ -236,6 +261,7 @@ int open64(const char *path, int flags, ...) {
     va_end(ap);
     return real_open64(path, flags, mode);
 }
+#endif
 EOF
 if [ "$(uname -s)" = "Darwin" ]; then
     shim_lib=$shim_dir/nosave.dylib
@@ -262,3 +288,33 @@ else
     tests_failed=$((tests_failed + 1))
     printf 'not ok %03d - %s\n' "$tests_run" "T9.7: auth.json was modified despite the failed save"
 fi
+
+# T9.8: when the proactive refresh fails on a request and that same request
+# returns 401, the client must NOT start a second refresh for the same
+# request: the issuer just proved itself unreachable, so another attempt
+# would only wait out a second timeout. The 401 surfaces directly, and the
+# mock asserts the token endpoint saw exactly two attempts (startup +
+# proactive) rather than three.
+fail401_home=$TEST_WORKDIR/fail401-home
+mkdir -p "$fail401_home" || exit 1
+cat > "$fail401_home/auth.json" <<EOF
+{
+  "auth_mode": "chatgpt",
+  "tokens": {
+    "id_token": "test-id-token",
+    "access_token": "$expired_jwt",
+    "refresh_token": "test-refresh-token",
+    "account_id": "test-account"
+  }
+}
+EOF
+chmod 600 "$fail401_home/auth.json"
+
+expect_process "T9.8: 401 after a failed proactive refresh does not refresh again" 1 \
+    run_with_mock token-refresh-401-after-failed-proactive env -u OPENAI_API_KEY CODEX_HOME="$fail401_home" \
+        PATH="$TEST_BIN_DIR:$PATH" \
+        microcodex Refresh fails then the request is unauthorized <<'STDOUT' 3<<'STDERR'
+STDOUT
+Warning: OAuth token endpoint returned HTTP 400: refresh_failed
+Agent failed: Codex API returned HTTP 401: token expired
+STDERR

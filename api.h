@@ -125,12 +125,14 @@ namespace microcodex {
         // Uses the stored OAuth refresh token to obtain a new access token,
         // persists it to the credential file, and installs it on the config
         // so the retried request authenticates. Returns an error when there is
-        // no refreshable credential set.
-        std::expected<void, std::string> refreshAccessToken();
+        // no refreshable credential set. The stop token aborts a hung token
+        // request so an interrupted turn does not wait out the timeout.
+        std::expected<void, std::string> refreshAccessToken(std::stop_token stop_token);
         // Refreshes only when the stored access token is past its JWT expiry.
         // A no-op (success) for API-key credentials and opaque tokens, and
         // for the rest of the session after one proactive refresh has failed.
-        std::expected<void, std::string> refreshAccessTokenIfExpired();
+        // Returns an error only when a refresh was attempted and failed.
+        std::expected<void, std::string> refreshAccessTokenIfExpired(std::stop_token stop_token);
         [[nodiscard]] bool canRefreshAccessToken() const;
         std::expected<std::string, std::string> requestSummary(std::span<const std::string> items, std::stop_token stop_token);
         std::expected<void, std::string> compactContext(std::stop_token stop_token, std::size_t &protected_start, bool force);

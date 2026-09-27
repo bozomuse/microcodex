@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <stop_token>
 #include <string>
 
 namespace microcodex {
@@ -127,7 +128,11 @@ namespace microcodex {
 
     // Uses the stored refresh token to obtain a new access token. OpenAI may
     // rotate either of the other tokens; absent values retain their old value.
-    std::expected<OAuthCredentials, std::string> refreshOAuthCredentials(const OAuthCredentials &credentials, OAuthOptions options = {});
+    // The stop token aborts a hung token request so interrupting a turn also
+    // cancels an in-flight refresh instead of waiting out the timeout.
+    std::expected<OAuthCredentials, std::string> refreshOAuthCredentials(
+        const OAuthCredentials &credentials, OAuthOptions options = {},
+        std::stop_token stop_token = {});
 
     // Returns true when a credentials file was deleted and false when the user
     // was already logged out.
