@@ -653,4 +653,11 @@ while request_number < expected_requests
     socket&.close
   end
 end
+if scenario == "message-queue-quit"
+  # The client quit mid-turn and must never dial again. The request loop
+  # above already exited, so a buggy follow-up would sit in the listen
+  # backlog unnoticed; linger briefly and fail if one arrives.
+  linger = IO.select([server], nil, nil, 5.0)
+  assert(linger.nil?, "client opened a follow-up connection after quit")
+end
 assert(models_requested, "models endpoint was not queried")
