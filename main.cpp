@@ -472,15 +472,11 @@ int main(const int argc, char *argv[]) {
         return 1;
     }
     // Keep transport selection at the executable boundary so black-box tests
-    // can exercise the real CLI against a deterministic loopback server.
-    // API keys authenticate against the OpenAI Platform rather than the
-    // ChatGPT Codex backend, so API-key mode targets the Platform responses
-    // endpoint; OAuth sessions keep the default Codex endpoint.
+    // can exercise the real CLI against a deterministic loopback server. The
+    // default remains the production Codex endpoint.
     if (const char *endpoint = std::getenv("MICROCODEX_API_ENDPOINT");
         endpoint != nullptr && endpoint[0] != '\0') {
         config.endpoint = endpoint;
-    } else if ((**credentials).api_key_mode) {
-        config.endpoint = "https://api.openai.com/v1/responses";
     }
     auto model_context = applyModelContextLimits(config);
     if (!model_context) {

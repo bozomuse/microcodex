@@ -16,7 +16,6 @@
 #include <expected>
 #include <filesystem>
 #include <future>
-#include <iostream>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -968,29 +967,20 @@ namespace microcodex {
         auto refreshed =
             refreshOAuthCredentials(*config_.oauth_credentials, config_.oauth_options);
         if (!refreshed) {
-            // The issuer is down or the grant is revoked; a later proactive
-            // check would fail the same way, so skip it for the rest of the
-            // session. The 401-driven path still retries per request.
-            proactive_refresh_failed_ = true;
             return std::unexpected(refreshed.error());
         }
         auto saved = saveOAuthCredentials(*refreshed);
         if (!saved) {
-            // As in ensureFreshCredentials: a save failure must not discard
-            // a valid refreshed token.
-            std::cerr << "Warning: " << saved.error()
-                      << "; using the refreshed token for this session only\n";
+            return std::unexpected(saved.error());
         }
         config_.access_token = refreshed->access_token;
         config_.account_id = refreshed->account_id;
         config_.oauth_credentials = std::move(*refreshed);
-        // The issuer answered, so a later proactive check is meaningful again.
-        proactive_refresh_failed_ = false;
         return {};
     }
 
     std::expected<void, std::string> CodexApi::refreshAccessTokenIfExpired() {
-        if (!canRefreshAccessToken() || proactive_refresh_failed_) {
+        if (!canRefreshAccessToken()) {
             return {};
         }
         auto expired = oauthAccessTokenExpired(*config_.oauth_credentials);
@@ -1009,8 +999,7 @@ namespace microcodex {
         // be accepted (clock skew between the JWT check and the server), and
         // a genuinely expired token is caught by the 401-driven refresh
         // below. This mirrors the warn-and-proceed behavior at startup in
-        // main(). A proactive refresh that already failed once this session
-        // is skipped rather than retried on every request.
+        // main().
         static_cast<void>(refreshAccessTokenIfExpired());
 
         for (int attempt = 0;; ++attempt) {

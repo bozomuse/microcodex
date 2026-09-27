@@ -128,8 +128,7 @@ namespace microcodex {
         // no refreshable credential set.
         std::expected<void, std::string> refreshAccessToken();
         // Refreshes only when the stored access token is past its JWT expiry.
-        // A no-op (success) for API-key credentials and opaque tokens, and
-        // for the rest of the session after one proactive refresh has failed.
+        // A no-op (success) for API-key credentials and opaque tokens.
         std::expected<void, std::string> refreshAccessTokenIfExpired();
         [[nodiscard]] bool canRefreshAccessToken() const;
         std::expected<std::string, std::string> requestSummary(std::span<const std::string> items, std::stop_token stop_token);
@@ -153,10 +152,6 @@ namespace microcodex {
         std::string session_id_;
         std::string turn_state_;
         std::size_t turn_number_ = 0;
-        // Set after a proactive refresh fails once: the issuer is down or the
-        // grant is revoked, so retrying the blocking refresh on every later
-        // request would only stall. Cleared by any successful refresh.
-        bool proactive_refresh_failed_ = false;
 
         mutable std::mutex turn_mutex_;
         bool turn_running_ = false;
