@@ -1371,6 +1371,10 @@ namespace {
             state.transcript.clear();
             state.transcript_bytes = 0;
             state.scroll = 0;
+            // A reset discards queued follow-ups too: a message retained
+            // across a failed launch must not run against the fresh
+            // conversation once the retry backoff elapses.
+            state.message_queue.clear();
             state.status = "Conversation reset";
         }
         state.dirty = true;
