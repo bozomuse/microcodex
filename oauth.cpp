@@ -718,6 +718,18 @@ namespace {
             return std::unexpected("OAuth issuer must be an HTTP(S) origin "
                                    "without query or fragment");
         }
+        if (options.issuer.starts_with("http://")) {
+            // A plaintext issuer would disclose the refresh token on the wire,
+            // so only loopback issuers are exempt: the black-box test harness
+            // overrides MICROCODEX_OAUTH_ISSUER with a 127.0.0.1 mock server.
+            constexpr std::string_view kHttpPrefix = "http://";
+            std::string_view rest(options.issuer.data() + kHttpPrefix.size(),
+                                  options.issuer.size() - kHttpPrefix.size());
+            std::string_view host = rest.substr(0, rest.find_first_of("/:?#"));
+            if (host != "127.0.0.1" && host != "::1" && host != "[::1]" && host != "localhost") {
+                return std::unexpected("OAuth issuer must use HTTPS unless it is a loopback address");
+            }
+        }
         if (options.token_request_timeout_seconds <= 0) {
             return std::unexpected("OAuth token request timeout must be greater than zero");
         }

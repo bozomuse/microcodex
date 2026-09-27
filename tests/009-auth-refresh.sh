@@ -243,3 +243,31 @@ STDOUT
 Warning: OAuth token endpoint returned HTTP 400: refresh_failed
 Agent failed: Codex API returned HTTP 401: token expired
 STDERR
+
+# T9.9: a plaintext non-loopback OAuth issuer is rejected before any token
+# grant is attempted, so the refresh token never travels over plaintext HTTP.
+# The loopback mock issuer used by every other test stays allowed.
+badissuer_home=$TEST_WORKDIR/badissuer-home
+mkdir -p "$badissuer_home" || exit 1
+cat > "$badissuer_home/auth.json" <<EOF2
+{
+  "auth_mode": "chatgpt",
+  "tokens": {
+    "id_token": "test-id-token",
+    "access_token": "$expired_jwt",
+    "refresh_token": "test-refresh-token",
+    "account_id": "test-account"
+  }
+}
+EOF2
+chmod 600 "$badissuer_home/auth.json"
+
+expect_process "T9.9: plaintext non-loopback OAuth issuer is rejected" 0 \
+    run_with_mock token-refresh-fallback env -u OPENAI_API_KEY CODEX_HOME="$badissuer_home" \
+        MICROCODEX_OAUTH_ISSUER=http://example.com/ \
+        PATH="$TEST_BIN_DIR:$PATH" \
+        microcodex Fallback after failed refresh <<'STDOUT' 3<<'STDERR'
+Hello, world!
+STDOUT
+Warning: OAuth issuer must use HTTPS unless it is a loopback address
+STDERR
