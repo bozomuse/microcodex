@@ -722,11 +722,39 @@ namespace {
             // A plaintext issuer would disclose the refresh token on the wire,
             // so only loopback issuers are exempt: the black-box test harness
             // overrides MICROCODEX_OAUTH_ISSUER with a 127.0.0.1 mock server.
-            constexpr std::string_view kHttpPrefix = "http://";
-            std::string_view rest(options.issuer.data() + kHttpPrefix.size(),
-                                  options.issuer.size() - kHttpPrefix.size());
-            std::string_view host = rest.substr(0, rest.find_first_of("/:?#"));
-            if (host != "127.0.0.1" && host != "::1" && host != "[::1]" && host != "localhost") {
+            // Parse the authority with libcurl's URL API rather than splitting
+            // at the first colon: userinfo can smuggle a remote host past a
+            // naive split, since "http://127.0.0.1:8080@issuer.example" has
+            // host issuer.example with userinfo "127.0.0.1:8080".
+            std::unique_ptr<CURLU, decltype(&curl_url_cleanup)> url(curl_url(), &curl_url_cleanup);
+            if (url == nullptr ||
+                curl_url_set(url.get(), CURLUPART_URL, options.issuer.c_str(), 0) != CURLUE_OK) {
+                return std::unexpected("OAuth issuer is not a valid URL");
+            }
+            char *user = nullptr;
+            const bool has_user =
+                curl_url_get(url.get(), CURLUPART_USER, &user, 0) == CURLUE_OK;
+            curl_free(user);
+            char *password = nullptr;
+            const bool has_password =
+                curl_url_get(url.get(), CURLUPART_PASSWORD, &password, 0) == CURLUE_OK;
+            curl_free(password);
+            if (has_user || has_password) {
+                return std::unexpected("OAuth issuer must not contain userinfo");
+            }
+            char *raw_host = nullptr;
+            if (curl_url_get(url.get(), CURLUPART_HOST, &raw_host, 0) != CURLUE_OK ||
+                raw_host == nullptr) {
+                curl_free(raw_host);
+                return std::unexpected("OAuth issuer is not a valid URL");
+            }
+            std::string host(raw_host);
+            curl_free(raw_host);
+            // libcurl keeps the brackets on IPv6 literals ("[::1]").
+            if (host.size() >= 2 && host.front() == '[' && host.back() == ']') {
+                host = host.substr(1, host.size() - 2);
+            }
+            if (host != "127.0.0.1" && host != "::1" && host != "localhost") {
                 return std::unexpected("OAuth issuer must use HTTPS unless it is a loopback address");
             }
         }

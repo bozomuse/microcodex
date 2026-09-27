@@ -271,3 +271,32 @@ Hello, world!
 STDOUT
 Warning: OAuth issuer must use HTTPS unless it is a loopback address
 STDERR
+
+# T9.10: userinfo in a plaintext issuer cannot smuggle a remote host past the
+# loopback check. "http://127.0.0.1:8080@issuer.example" parses as host
+# issuer.example with userinfo "127.0.0.1:8080", so it must be rejected before
+# any token grant is attempted.
+userinfo_home=$TEST_WORKDIR/userinfo-home
+mkdir -p "$userinfo_home" || exit 1
+cat > "$userinfo_home/auth.json" <<EOF2
+{
+  "auth_mode": "chatgpt",
+  "tokens": {
+    "id_token": "test-id-token",
+    "access_token": "$expired_jwt",
+    "refresh_token": "test-refresh-token",
+    "account_id": "test-account"
+  }
+}
+EOF2
+chmod 600 "$userinfo_home/auth.json"
+
+expect_process "T9.10: plaintext issuer with userinfo is rejected" 0 \
+    run_with_mock token-refresh-fallback env -u OPENAI_API_KEY CODEX_HOME="$userinfo_home" \
+        MICROCODEX_OAUTH_ISSUER='http://127.0.0.1:8080@issuer.example' \
+        PATH="$TEST_BIN_DIR:$PATH" \
+        microcodex Fallback after failed refresh <<'STDOUT' 3<<'STDERR'
+Hello, world!
+STDOUT
+Warning: OAuth issuer must not contain userinfo
+STDERR
