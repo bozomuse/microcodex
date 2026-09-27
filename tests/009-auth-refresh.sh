@@ -177,10 +177,12 @@ STDERR
 case_cwd=$skip_cwd
 
 # T9.7: when persisting the refreshed token fails, the turn still goes out
-# with the refreshed token instead of discarding it. A tiny LD_PRELOAD /
-# DYLD_INSERT_LIBRARIES shim fails the credential temp-file creation with
-# EACCES, which breaks the save deterministically even for privileged users.
-# auth.json must keep the stale token afterwards.
+# with the refreshed token instead of discarding it. The failure is injected
+# through the deterministic MICROCODEX_TEST_FAIL_CREDENTIAL_SAVE seam in
+# oauth.cpp: an LD_PRELOAD/DYLD_INSERT_LIBRARIES open() interposition shim
+# cannot reliably intercept the file-open entry point on Darwin, so the
+# forced failure would silently never happen there. auth.json must keep the
+# stale token afterwards.
 savefail_home=$TEST_WORKDIR/savefail-home
 mkdir -p "$savefail_home" || exit 1
 cat > "$savefail_home/auth.json" <<EOF
@@ -196,86 +198,9 @@ cat > "$savefail_home/auth.json" <<EOF
 EOF
 chmod 600 "$savefail_home/auth.json"
 
-shim_dir=$TEST_WORKDIR/savefail-shim
-mkdir -p "$shim_dir" || exit 1
-cat > "$shim_dir/nosave.c" <<'EOF'
-#define _GNU_SOURCE
-#include <dlfcn.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <stdarg.h>
-#include <string.h>
-#include <sys/types.h>
-
-static int fail_credential_tmp(const char *path) {
-    return path != NULL && strstr(path, "auth.json.tmp.") != NULL;
-}
-
-#ifdef __APPLE__
-// macOS uses two-level namespaces: merely redefining open() in an injected
-// dylib does NOT interpose it for other images, so the Linux-style symbol
-// override silently fails and the save succeeds. Register the replacement
-// through the __DATA,__interpose section instead.
-static int my_open(const char *path, int flags, ...) {
-    if (fail_credential_tmp(path)) {
-        errno = EACCES;
-        return -1;
-    }
-    int (*real_open)(const char *, int, ...) = dlsym(RTLD_NEXT, "open");
-    va_list ap;
-    va_start(ap, flags);
-    mode_t mode = va_arg(ap, mode_t);
-    va_end(ap);
-    return real_open(path, flags, mode);
-}
-
-__attribute__((used)) static struct {
-    const void *replacement;
-    const void *replacee;
-} interposers[] __attribute__((section("__DATA,__interpose"))) = {
-    {(const void *)my_open, (const void *)open},
-};
-#else
-int open(const char *path, int flags, ...) {
-    if (fail_credential_tmp(path)) {
-        errno = EACCES;
-        return -1;
-    }
-    int (*real_open)(const char *, int, ...) = dlsym(RTLD_NEXT, "open");
-    va_list ap;
-    va_start(ap, flags);
-    mode_t mode = va_arg(ap, mode_t);
-    va_end(ap);
-    return real_open(path, flags, mode);
-}
-
-int open64(const char *path, int flags, ...) {
-    if (fail_credential_tmp(path)) {
-        errno = EACCES;
-        return -1;
-    }
-    int (*real_open64)(const char *, int, ...) = dlsym(RTLD_NEXT, "open64");
-    va_list ap;
-    va_start(ap, flags);
-    mode_t mode = va_arg(ap, mode_t);
-    va_end(ap);
-    return real_open64(path, flags, mode);
-}
-#endif
-EOF
-if [ "$(uname -s)" = "Darwin" ]; then
-    shim_lib=$shim_dir/nosave.dylib
-    cc -dynamiclib -o "$shim_lib" "$shim_dir/nosave.c" || exit 1
-    shim_preload="DYLD_INSERT_LIBRARIES=$shim_lib"
-else
-    shim_lib=$shim_dir/nosave.so
-    cc -shared -fPIC -o "$shim_lib" "$shim_dir/nosave.c" -ldl || exit 1
-    shim_preload="LD_PRELOAD=$shim_lib"
-fi
-
 expect_process "T9.7: failed credential save keeps the refreshed token for the session" 0 \
     run_with_mock token-refresh-save-fail env -u OPENAI_API_KEY CODEX_HOME="$savefail_home" \
-        "$shim_preload" PATH="$TEST_BIN_DIR:$PATH" \
+        MICROCODEX_TEST_FAIL_CREDENTIAL_SAVE=1 PATH="$TEST_BIN_DIR:$PATH" \
         microcodex Refresh despite an unwritable credential file <<'STDOUT' 3<<'STDERR'
 Hello, world!
 STDOUT

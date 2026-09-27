@@ -1357,6 +1357,18 @@ namespace microcodex {
             return validation;
         }
 
+        // Deterministic test seam (see T9.7): setting
+        // MICROCODEX_TEST_FAIL_CREDENTIAL_SAVE forces the save to fail with
+        // the same EACCES error a blocked temp-file creation would produce.
+        // The LD_PRELOAD/DYLD interposition approach this replaces cannot
+        // reliably intercept the file-open entry point on Darwin, where the
+        // forced failure would silently never happen.
+        if (const char *force_save_failure = std::getenv("MICROCODEX_TEST_FAIL_CREDENTIAL_SAVE");
+            force_save_failure != nullptr && *force_save_failure != '\0') {
+            errno = EACCES;
+            return std::unexpected(systemError("Could not create temporary credentials file"));
+        }
+
         // Preserve Codex's auth.json shape rather than inventing a second
         // credential format. account_id is nullable in the upstream schema.
         std::string contents = "{\n  \"auth_mode\": \"chatgpt\",\n  \"OPENAI_API_KEY\": null,\n  "
