@@ -34,6 +34,7 @@
 #include <ctime>
 #include <expected>
 #include <filesystem>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <optional>
@@ -1440,7 +1441,11 @@ namespace microcodex {
         }
         auto saved = saveOAuthCredentials(*refreshed);
         if (!saved) {
-            return std::unexpected(saved.error());
+            // A save failure must not discard a valid refreshed token: keep
+            // it for this session and warn, so the turn still authenticates.
+            // The next process will refresh and retry the save on its own.
+            std::cerr << "Warning: " << saved.error()
+                      << "; using the refreshed token for this session only\n";
         }
         return std::move(*refreshed);
     }
